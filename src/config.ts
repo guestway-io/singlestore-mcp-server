@@ -65,19 +65,24 @@ function parseList(value: string | undefined): string[] {
 
 function loadCaBundle(): string {
   const bundlePath = resolve(__dirname, 'ca', 'singlestore-bundle.pem');
+  let pem: string;
   try {
-    const pem = readFileSync(bundlePath, 'utf8');
-    if (!pem.includes('BEGIN CERTIFICATE')) {
-      throw new Error('CA bundle is missing PEM markers');
-    }
-    return pem;
+    pem = readFileSync(bundlePath, 'utf8');
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     throw new Error(
-      `Failed to load vendored SingleStore CA bundle from ${bundlePath}: ${reason}. ` +
+      `Failed to read vendored SingleStore CA bundle from ${bundlePath}: ${reason}. ` +
+        'Run `npm run update-ca` to refresh it.',
+      { cause: err },
+    );
+  }
+  if (!pem.includes('BEGIN CERTIFICATE')) {
+    throw new Error(
+      `Invalid SingleStore CA bundle at ${bundlePath}: missing PEM markers. ` +
         'Run `npm run update-ca` to refresh it.',
     );
   }
+  return pem;
 }
 
 function parseBool(value: string | undefined, fallback: boolean): boolean {
