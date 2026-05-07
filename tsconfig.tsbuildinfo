@@ -1,1 +1,1 @@
-{"root":["./src/index.ts","./src/types.d.ts"],"version":"5.8.2"}
+{"root":["./src/config.ts","./src/db.ts","./src/http.ts","./src/index.ts","./src/logger.ts","./src/server.ts","./src/sqlguard.ts","./src/profile/analyzer.ts","./src/tools/describetable.ts","./src/tools/generateerdiagram.ts","./src/tools/index.ts","./src/tools/listtables.ts","./src/tools/optimizesql.ts","./src/tools/runreadquery.ts","./src/tools/shared.ts"],"version":"5.9.3"}

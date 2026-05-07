@@ -29,3 +29,10 @@ pids/
 *.pid
 *.seed
 *.pid.lock
+
+# Disabled git directory left over from the upstream fork
+.git_disabled/
+
+# tsx / TS incremental
+tsconfig.tsbuildinfo
+

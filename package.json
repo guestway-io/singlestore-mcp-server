@@ -1,40 +1,59 @@
 {
-  "name": "mcp-server-singlestore",
-  "version": "1.0.0",
-  "description": "MCP server for interacting with SingleStore databases",
+  "name": "@guestway/singlestore-mcp-server",
+  "version": "0.1.0",
+  "description": "Guestway-branded MCP server for read-only SingleStore access (stdio + Streamable HTTP).",
   "main": "build/index.js",
   "type": "module",
+  "bin": {
+    "guestway-singlestore-mcp": "build/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "build": "rm -rf build && tsc --build --force && chmod +x build/index.js",
+    "build": "rm -rf build && tsc --build --force && cp -R src/ca build/ca && chmod +x build/index.js",
     "start": "node build/index.js",
-    "start:sse": "SSE_ENABLED=true node build/index.js",
-    "start:inspector": "SSE_ENABLED=true MCP_SSE_PORT=8081 node build/index.js",
-    "inspector": "./run_with_inspector.sh",
-    "test:sse": "./test_sse_connection.sh",
-    "debug:headers": "./debug_headers.sh",
+    "start:http": "MCP_HTTP_ENABLED=true node build/index.js",
     "dev": "tsc -w",
-    "dev:sse": "tsc -w & SSE_ENABLED=true nodemon build/index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "inspect": "npx -y @modelcontextprotocol/inspector node build/index.js",
+    "health": "curl -fsS \"http://${MCP_HTTP_HOST:-127.0.0.1}:${MCP_HTTP_PORT:-8081}/healthz\" && echo",
+    "update-ca": "tsx scripts/update-ca.ts",
+    "test": "node --test --import tsx test/**/*.test.ts"
   },
   "keywords": [
     "mcp",
+    "model-context-protocol",
     "singlestore",
+    "guestway",
     "database",
-    "er-diagram"
+    "read-only"
   ],
-  "author": "",
+  "author": "Guestway <engineering@guestway.io>",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guestway-io/singlestore-mcp-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/guestway-io/singlestore-mcp-server/issues"
+  },
+  "homepage": "https://github.com/guestway-io/singlestore-mcp-server#readme",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.6.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "mysql2": "^3.9.1"
+    "express": "^5.0.1",
+    "express-rate-limit": "^8.1.0",
+    "helmet": "^8.1.0",
+    "mysql2": "^3.22.0",
+    "node-sql-parser": "^5.4.0",
+    "pino": "^10.0.0",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
-    "@types/express": "^4.17.21",
-    "@types/node": "^20.11.19",
-    "nodemon": "^3.0.3",
-    "typescript": "^5.3.3"
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.3"
   }
 }

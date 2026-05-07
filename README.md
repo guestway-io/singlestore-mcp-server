@@ -1,691 +1,275 @@
-# SingleStore MCP Server
+# Guestway SingleStore MCP server
 
-[![smithery badge](https://smithery.ai/badge/@madhukarkumar/singlestore-mcp-server)](https://smithery.ai/server/@madhukarkumar/singlestore-mcp-server)
+Read-only [Model Context Protocol](https://modelcontextprotocol.io) server
+for SingleStore. Used at Guestway to let Claude Desktop (and any other MCP
+client) explore our SingleStore database without giving it write access.
 
-A Model Context Protocol (MCP) server for interacting with SingleStore databases. This server provides tools for querying tables, describing schemas, and generating ER diagrams.
+Forked from
+[`madhukarkumar/singlestore-mcp-server`](https://github.com/madhukarkumar/singlestore-mcp-server)
+in May 2026; the fork is essentially a rewrite (security hardening, dropped
+write tools, Streamable HTTP transport, modular code, vendored CA bundle).
+See [`CHANGELOG.md`](CHANGELOG.md) for the full diff.
 
-## Features
+## What it exposes
 
-- List all tables in the database
-- Execute custom SQL queries
-- Get detailed table information including schema and sample data
-- Generate Mermaid ER diagrams of database schema
-- SSL support with automatic CA bundle fetching
-- Proper error handling and TypeScript type safety
+Five read-only tools, all annotated with `readOnlyHint: true`:
 
-## Prerequisites
+| Tool                   | Purpose                                                                  |
+| ---------------------- | ------------------------------------------------------------------------ |
+| `list_tables`          | List tables in the configured database.                                  |
+| `describe_table`       | Schema, row count, 5-row sample. Identifier validated.                   |
+| `run_read_query`       | Run a single SELECT (or pure-SELECT CTE). Capped at 1000 rows.           |
+| `generate_er_diagram`  | Mermaid `erDiagram` derived from `information_schema`.                   |
+| `optimize_sql`         | `PROFILE` a SELECT, return summary, bottlenecks, and recommendations.    |
 
-- Node.js 16 or higher
-- npm or yarn
-- Access to a SingleStore database
-- SingleStore CA bundle (automatically fetched from portal)
+`run_read_query` and `optimize_sql` are gated by `node-sql-parser` plus a
+forbidden-token backstop. Stacked statements, DDL, DML, `SET`,
+`SELECT ... FOR UPDATE`, and `INTO OUTFILE` are all rejected.
 
-## Installation
+## Architecture (Guestway deployment)
 
-### Installing via Smithery
-
-To install SingleStore MCP Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@madhukarkumar/singlestore-mcp-server):
-
-```bash
-npx -y @smithery/cli install @madhukarkumar/singlestore-mcp-server --client claude
+```
+Claude Desktop (laptop)
+    │  stdio
+    ▼
+mcp-remote
+    │  HTTPS + bearer (Streamable HTTP)
+    ▼
+guestway-singlestore-mcp  ← Mac mini, Docker
+    │  plain TCP MySQL on tunnel:3306
+    ▼
+tunnel sidecar (websocat)  ← Docker network neighbor
+    │  wss + Cloudflare Access service-token headers
+    ▼
+Cloudflare Access edge ──► EC2: SingleStore Studio + cloudflared
+                                   │  TCP 3306
+                                   ▼
+                            SingleStore cluster
 ```
 
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd mcp-server-singlestore
-```
+The `tunnel` sidecar piggy-backs on Studio's built-in
+`wss://${STUDIO_HOST}/proxy?hostname=&port=` endpoint, which is plain
+raw-TCP-over-WebSocket framing. Same path `export-org.nu` uses; no custom
+protocol code. See [Tunnel](#tunnel-mac-mini--singlestore-via-studios-proxy).
 
-2. Install dependencies:
+## Requirements
+
+- Node.js 20+ (Docker image pins Node 22).
+- A reachable MySQL endpoint. The reference Guestway deployment uses the
+  Studio `/proxy` tunnel described below; pointing the MCP at a direct
+  TCP+TLS Helios host also works (set `SINGLESTORE_HOST` directly and turn
+  the sidecar off).
+- A SingleStore user with **read-only** privileges. Do not point this
+  server at a user that can write or DDL.
+
+## Configuration
+
+Copy `.env.example` to `.env` and edit.
+
+**Tunnel + Cloudflare Access:**
+
+| Var                        | Description                                                                           |
+| -------------------------- | ------------------------------------------------------------------------------------- |
+| `STUDIO_HOST`              | Studio hostname (e.g. `singlestore.guestway.io`). Sidecar dials `wss://STUDIO_HOST/proxy`. |
+| `REMOTE_DB_HOST`           | DB host as Studio sees it. Defaults to `127.0.0.1`.                                   |
+| `REMOTE_DB_PORT`           | DB port as Studio sees it. Defaults to `3306`.                                        |
+| `CF_ACCESS_CLIENT_ID`      | Cloudflare Access service-token Client ID. Recommended.                               |
+| `CF_ACCESS_CLIENT_SECRET`  | Cloudflare Access service-token Client Secret.                                        |
+| `CF_AUTHORIZATION`         | Optional dev fallback: value of the `CF_Authorization` cookie from a browser session. |
+
+**SingleStore connection (through the tunnel by default):**
+
+| Var                       | Description                                                            |
+| ------------------------- | ---------------------------------------------------------------------- |
+| `SINGLESTORE_HOST`        | `tunnel` when using the sidecar; a real host when bypassing it.        |
+| `SINGLESTORE_PORT`        | Defaults to `3306`.                                                    |
+| `SINGLESTORE_USER`        | A read-only role.                                                      |
+| `SINGLESTORE_PASSWORD`    | Password.                                                              |
+| `SINGLESTORE_DATABASE`    | Database name.                                                         |
+
+**SingleStore TLS (optional; off by default):**
+
+| Var                                   | Default | Notes                                                                                  |
+| ------------------------------------- | ------- | -------------------------------------------------------------------------------------- |
+| `SINGLESTORE_TLS`                     | `false` | Flip on if your cluster's MySQL port speaks TLS.                                       |
+| `SINGLESTORE_TLS_SERVERNAME`          | _unset_ | SNI override so mysql2 verifies the cert against the cluster name, not `tunnel`.       |
+| `SINGLESTORE_TLS_REJECT_UNAUTHORIZED` | `true`  | Last-resort escape hatch for self-signed clusters. Logs a loud `WARN` when set false.  |
+
+**HTTP transport (opt-in; stdio always works for local Claude Desktop):**
+
+| Var                      | Default       | Notes                                                                             |
+| ------------------------ | ------------- | --------------------------------------------------------------------------------- |
+| `MCP_HTTP_ENABLED`       | `false`       | Set to `true` for remote clients.                                                 |
+| `MCP_HTTP_HOST`          | `127.0.0.1`   | Refuses to bind to a non-loopback host without `MCP_BEARER_TOKEN`.                |
+| `MCP_HTTP_PORT`          | `8081`        |                                                                                   |
+| `MCP_BEARER_TOKEN`       | _unset_       | Required for non-loopback. Generate with `openssl rand -hex 32`.                  |
+| `MCP_ALLOWED_ORIGINS`    | _unset_       | Comma-separated CORS allowlist. Empty = deny all browser origins.                 |
+| `MCP_ALLOWED_HOSTS`      | _unset_       | Comma-separated `Host`-header allowlist (DNS-rebinding defense).                  |
+| `MCP_RATE_LIMIT_PER_MIN` | `120`         | Per-IP requests per minute against `/mcp`.                                        |
+| `MCP_BODY_LIMIT`         | `256kb`       | Max request body.                                                                 |
+| `LOG_LEVEL`              | `info`        | `pino` levels.                                                                    |
+
+## Local development
+
 ```bash
 npm install
-```
-
-3. Build the server:
-```bash
 npm run build
+npm test                   # runs SQL guard tests
+SINGLESTORE_HOST=... SINGLESTORE_USER=... SINGLESTORE_PASSWORD=... \
+SINGLESTORE_DATABASE=... npm start
 ```
 
-## Environment Variables
+`npm run inspect` launches `@modelcontextprotocol/inspector` against the
+stdio binary for interactive testing.
 
-### Required Environment Variables
+## Docker (Guestway Mac mini)
 
-The server requires the following environment variables for database connection:
-
-```env
-SINGLESTORE_HOST=your-host.singlestore.com
-SINGLESTORE_PORT=3306
-SINGLESTORE_USER=your-username
-SINGLESTORE_PASSWORD=your-password
-SINGLESTORE_DATABASE=your-database
-```
-
-All these environment variables are required for the server to establish a connection to your SingleStore database. The connection uses SSL with the SingleStore CA bundle, which is automatically fetched from the SingleStore portal.
-
-### Optional Environment Variables
-
-For SSE (Server-Sent Events) protocol support:
-
-```env
-SSE_ENABLED=true       # Enable the SSE HTTP server (default: false if not set)
-SSE_PORT=3333          # HTTP port for the SSE server (default: 3333 if not set)
-```
-
-### Setting Environment Variables
-
-1. **In Your Shell**:
-   Set the variables in your terminal before running the server:
-   ```bash
-   export SINGLESTORE_HOST=your-host.singlestore.com
-   export SINGLESTORE_PORT=3306
-   export SINGLESTORE_USER=your-username
-   export SINGLESTORE_PASSWORD=your-password
-   export SINGLESTORE_DATABASE=your-database
-   ```
-
-2. **In Client Configuration Files**:
-   Add the variables to your MCP client configuration file as shown in the integration sections below.
-
-## Usage
-
-### Protocol Support
-
-This server supports two protocols for client integration:
-
-1. **MCP Protocol**: The standard Model Context Protocol using stdio communication, used by Claude Desktop, Windsurf, and Cursor.
-2. **SSE Protocol**: Server-Sent Events over HTTP for web-based clients and applications that need real-time data streaming.
-
-Both protocols expose the same tools and functionality, allowing you to choose the best integration method for your use case.
-
-### Available Tools
-
-1. **list_tables**
-   - Lists all tables in the database
-   - No parameters required
-   ```typescript
-   use_mcp_tool({
-     server_name: "singlestore",
-     tool_name: "list_tables",
-     arguments: {}
-   })
-   ```
-
-2. **query_table**
-   - Executes a custom SQL query
-   - Parameters:
-     - query: SQL query string
-   ```typescript
-   use_mcp_tool({
-     server_name: "singlestore",
-     tool_name: "query_table",
-     arguments: {
-       query: "SELECT * FROM your_table LIMIT 5"
-     }
-   })
-   ```
-
-3. **describe_table**
-   - Gets detailed information about a table
-   - Parameters:
-     - table: Table name
-   ```typescript
-   use_mcp_tool({
-     server_name: "singlestore",
-     tool_name: "describe_table",
-     arguments: {
-       table: "your_table"
-     }
-   })
-   ```
-
-4. **generate_er_diagram**
-   - Generates a Mermaid ER diagram of the database schema
-   - No parameters required
-   ```typescript
-   use_mcp_tool({
-     server_name: "singlestore",
-     tool_name: "generate_er_diagram",
-     arguments: {}
-   })
-   ```
-
-5. **run_read_query**
-   - Executes a read-only (SELECT) query on the database
-   - Parameters:
-     - query: SQL SELECT query to execute
-   ```typescript
-   use_mcp_tool({
-     server_name: "singlestore",
-     tool_name: "run_read_query",
-     arguments: {
-       query: "SELECT * FROM your_table LIMIT 5"
-     }
-   })
-   ```
-
-6. **create_table**
-   - Create a new table in the database with specified columns and constraints
-   - Parameters:
-     - table_name: Name of the table to create
-     - columns: Array of column definitions
-     - table_options: Optional table configuration
-   ```typescript
-   use_mcp_tool({
-     server_name: "singlestore",
-     tool_name: "create_table",
-     arguments: {
-       table_name: "new_table",
-       columns: [
-         {
-           name: "id",
-           type: "INT",
-           nullable: false,
-           auto_increment: true
-         },
-         {
-           name: "name",
-           type: "VARCHAR(255)",
-           nullable: false
-         }
-       ],
-       table_options: {
-         shard_key: ["id"],
-         sort_key: ["name"]
-       }
-     }
-   })
-   ```
-
-7. **generate_synthetic_data**
-   - Generate and insert synthetic data into an existing table
-   - Parameters:
-     - table: Name of the table to insert data into
-     - count: Number of rows to generate (default: 100)
-     - column_generators: Custom generators for specific columns
-     - batch_size: Number of rows to insert in each batch (default: 1000)
-   ```typescript
-   use_mcp_tool({
-     server_name: "singlestore",
-     tool_name: "generate_synthetic_data",
-     arguments: {
-       table: "customers",
-       count: 1000,
-       column_generators: {
-         "customer_id": {
-           "type": "sequence",
-           "start": 1000
-         },
-         "status": {
-           "type": "values",
-           "values": ["active", "inactive", "pending"]
-         },
-         "signup_date": {
-           "type": "formula",
-           "formula": "NOW() - INTERVAL FLOOR(RAND() * 365) DAY"
-         }
-       },
-       batch_size: 500
-     }
-   })
-   ```
-
-8. **optimize_sql**
-   - Analyze a SQL query using PROFILE and provide optimization recommendations
-   - Parameters:
-     - query: SQL query to analyze and optimize
-   ```typescript
-   use_mcp_tool({
-     server_name: "singlestore",
-     tool_name: "optimize_sql",
-     arguments: {
-       query: "SELECT * FROM customers JOIN orders ON customers.id = orders.customer_id WHERE region = 'west'"
-     }
-   })
-   ```
-   - The response includes:
-     - Original query
-     - Performance profile summary (total runtime, compile time, execution time)
-     - List of detected bottlenecks
-     - Optimization recommendations with impact levels (high/medium/low)
-     - Suggestions for indexes, joins, memory usage, and other optimizations
-
-### Running Standalone
-
-1. Build the server:
 ```bash
-npm run build
+cp .env.example .env
+# edit .env
+
+docker compose build
+docker compose up -d
+docker compose logs -f mcp
 ```
 
-2. Run the server with MCP protocol only:
-```bash
-node build/index.js
-```
+Health: `curl http://<mini-ip>:8081/healthz`.
 
-3. Run the server with both MCP and SSE protocols:
-```bash
-SSE_ENABLED=true SSE_PORT=3333 node build/index.js
-```
+The published Streamable HTTP endpoint is `POST /mcp`.
 
-### Using the SSE Protocol
+## Wiring Claude Desktop
 
-When SSE is enabled, the server exposes the following HTTP endpoints:
-
-1. **Root Endpoint**
-   ```
-   GET /
-   ```
-   Returns server information and available endpoints.
-
-2. **Health Check**
-   ```
-   GET /health
-   ```
-   Returns status information about the server.
-
-3. **SSE Connection**
-   ```
-   GET /sse
-   ```
-   Establishes a Server-Sent Events connection for real-time updates.
-
-4. **List Tools**
-   ```
-   GET /tools
-   ```
-   Returns a list of all available tools, same as the MCP `list_tools` functionality.
-
-   Also supports POST requests for MCP Inspector compatibility:
-   ```
-   POST /tools
-   Content-Type: application/json
-   
-   {
-     "jsonrpc": "2.0",
-     "id": "request-id",
-     "method": "mcp.list_tools",
-     "params": {}
-   }
-   ```
-
-5. **Call Tool**
-   ```
-   POST /call-tool
-   Content-Type: application/json
-   
-   {
-     "name": "tool_name",
-     "arguments": {
-       "param1": "value1",
-       "param2": "value2"
-     },
-     "client_id": "optional_sse_client_id_for_streaming_response"
-   }
-   ```
-   Executes a tool with the provided arguments.
-   
-   - If `client_id` is provided, the response is streamed to that SSE client.
-   - If `client_id` is omitted, the response is returned directly in the HTTP response.
-   
-   Also supports standard MCP format for MCP Inspector compatibility:
-   ```
-   POST /call-tool
-   Content-Type: application/json
-   
-   {
-     "jsonrpc": "2.0",
-     "id": "request-id",
-     "method": "mcp.call_tool",
-     "params": {
-       "name": "tool_name",
-       "arguments": {
-         "param1": "value1",
-         "param2": "value2"
-       },
-       "_meta": {
-         "client_id": "optional_sse_client_id_for_streaming_response"
-       }
-     }
-   }
-   ```
-
-#### SSE Event Types
-
-When using SSE connections, the server sends the following event types:
-
-1. **message** (unnamed event): Sent when an SSE connection is successfully established.
-2. **open**: Additional connection established event.
-3. **message**: Used for all MCP protocol messages including tool start, result, and error events.
-
-All events follow the JSON-RPC 2.0 format used by the MCP protocol. The system uses the standard `message` event type for compatibility with the MCP Inspector and most SSE client libraries.
-
-#### Example JavaScript Client
-
-```javascript
-// Connect to SSE endpoint
-const eventSource = new EventSource('http://localhost:3333/sse');
-let clientId = null;
-
-// Handle connection establishment via unnamed event
-eventSource.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  if (data.type === 'connection_established') {
-    clientId = data.clientId;
-    console.log(`Connected with client ID: ${clientId}`);
-  }
-};
-
-// Handle open event
-eventSource.addEventListener('open', (event) => {
-  console.log('SSE connection opened via open event');
-});
-
-// Handle all MCP messages
-eventSource.addEventListener('message', (event) => {
-  const data = JSON.parse(event.data);
-  
-  if (data.jsonrpc === '2.0') {
-    if (data.result) {
-      console.log('Tool result:', data.result);
-    } else if (data.error) {
-      console.error('Tool error:', data.error);
-    } else if (data.method === 'mcp.call_tool.update') {
-      console.log('Tool update:', data.params);
-    }
-  }
-});
-
-// Call a tool with streaming response (custom format)
-async function callTool(name, args) {
-  const response = await fetch('http://localhost:3333/call-tool', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      name: name,
-      arguments: args,
-      client_id: clientId
-    })
-  });
-  return response.json();
-}
-
-// Call a tool with streaming response (MCP format)
-async function callToolMcp(name, args) {
-  const response = await fetch('http://localhost:3333/call-tool', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 'request-' + Date.now(),
-      method: 'mcp.call_tool',
-      params: {
-        name: name,
-        arguments: args,
-        _meta: {
-          client_id: clientId
-        }
-      }
-    })
-  });
-  return response.json();
-}
-
-// Example usage
-callTool('list_tables', {})
-  .then(response => console.log('Request accepted:', response));
-```
-
-### Using with MCP Inspector
-
-The MCP Inspector is a browser-based tool for testing and debugging MCP servers. To use it with this server:
-
-1. Start both the server and MCP inspector in one command:
-   ```bash
-   npm run inspector
-   ```
-   
-   Or start just the server with:
-   ```bash
-   npm run start:inspector
-   ```
-
-2. To install and run the MCP Inspector separately:
-   ```bash
-   npx @modelcontextprotocol/inspector
-   ```
-   
-   The inspector will open in your default browser.
-
-3. When the MCP Inspector opens:
-   
-   a. Enter the URL in the connection field:
-      ```
-      http://localhost:8081
-      ```
-      
-      Note: The actual port may vary depending on your configuration. Check the server 
-      startup logs for the actual port being used. The server will output:
-      ```
-      MCP SingleStore SSE server listening on port XXXX
-      ```
-      
-   b. Make sure "SSE" is selected as the transport type
-   
-   c. Click "Connect"
-
-4. If you encounter connection issues, try these alternatives:
-   
-   a. Try connecting to a specific endpoint:
-      ```
-      http://localhost:8081/stream
-      ```
-      
-   b. Try using your machine's actual IP address:
-      ```
-      http://192.168.1.x:8081
-      ```
-      
-   c. If running in Docker:
-      ```
-      http://host.docker.internal:8081
-      ```
-
-5. **Debugging connection issues**:
-   
-   a. Verify the server is running by visiting http://localhost:8081 in your browser
-   
-   b. Check the server logs for connection attempts
-   
-   c. Try restarting both the server and inspector
-   
-   d. Make sure no other service is using port 8081
-   
-   e. Test SSE connection with the provided script:
-      ```bash
-      npm run test:sse
-      ```
-      
-      Or manually with curl:
-      ```bash
-      curl -N http://localhost:8081/sse
-      ```
-      
-   f. Verify your firewall settings allow connections to port 8081
-
-6. Once connected, the inspector will show all available tools and allow you to test them interactively.
-
-⚠️ **Note**: When using the MCP Inspector, you must use the full URL, including the `http://` prefix.
-
-## MCP Client Integration
-
-### Installing in Claude Desktop
-
-1. Add the server configuration to your Claude Desktop config file located at:
-   - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+Use [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) on the laptop
+to bridge stdio to the Mac mini's HTTP endpoint.
 
 ```json
 {
   "mcpServers": {
-    "singlestore": {
-      "command": "node",
-      "args": ["path/to/mcp-server-singlestore/build/index.js"],
-      "env": {
-        "SINGLESTORE_HOST": "your-host.singlestore.com",
-        "SINGLESTORE_PORT": "3306",
-        "SINGLESTORE_USER": "your-username",
-        "SINGLESTORE_PASSWORD": "your-password",
-        "SINGLESTORE_DATABASE": "your-database",
-        "SSE_ENABLED": "true",
-        "SSE_PORT": "3333"
-      }
+    "guestway-singlestore": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "http://<mini-ip>:8081/mcp",
+        "--header",
+        "Authorization: Bearer <MCP_BEARER_TOKEN>"
+      ]
     }
   }
 }
 ```
 
-The SSE_ENABLED and SSE_PORT variables are optional. Include them if you want to enable the HTTP server with SSE support alongside the standard MCP protocol.
+For purely local stdio use (no Mac mini), point `command` at
+`node build/index.js` and provide `SINGLESTORE_*` in `env`.
 
-2. Restart the Claude Desktop App
+## Tunnel: Mac mini → SingleStore via Studio's `/proxy`
 
-3. In your conversation with Claude, you can now use the SingleStore MCP server with:
-```
-use_mcp_tool({
-  server_name: "singlestore",
-  tool_name: "list_tables",
-  arguments: {}
-})
-```
+`mysql2` only speaks the MySQL wire protocol over TCP. Guestway prod
+doesn't expose port 3306 directly; instead, SingleStore Studio sits behind
+Cloudflare Access at `singlestore.guestway.io` and exposes a generic
+raw-TCP-over-WebSocket endpoint at `/proxy?hostname=&port=`. The `tunnel`
+sidecar bridges the MCP container's TCP traffic into that WebSocket using
+[`websocat`](https://github.com/vi/websocat) — exactly the same way
+`export-org.nu` does it.
 
-### Installing in Windsurf 
+### One-time Cloudflare setup
 
-1. Add the server configuration to your Windsurf config file located at:
-   - macOS: `~/Library/Application Support/Windsurf/config.json`
-   - Windows: `%APPDATA%\Windsurf\config.json`
+1. Open Zero Trust > Access > Applications and edit the existing
+   `singlestore.guestway.io` application.
+2. Add a **Service Auth** policy (Action: Service Auth) that allows your
+   service token. Save.
+3. Open Zero Trust > Access > Service Auth > **Create service token**.
+   Name it (e.g. `mcp-mac-mini`), pick a long expiry, and copy the Client
+   ID + Client Secret immediately — the secret is shown once.
+4. Drop the Client ID and Secret into your `.env` as `CF_ACCESS_CLIENT_ID`
+   and `CF_ACCESS_CLIENT_SECRET`.
 
-```json
-{
-  "mcpServers": {
-    "singlestore": {
-      "command": "node",
-      "args": ["path/to/mcp-server-singlestore/build/index.js"],
-      "env": {
-        "SINGLESTORE_HOST": "your-host.singlestore.com",
-        "SINGLESTORE_PORT": "3306",
-        "SINGLESTORE_USER": "your-username",
-        "SINGLESTORE_PASSWORD": "your-password",
-        "SINGLESTORE_DATABASE": "your-database",
-        "SSE_ENABLED": "true",
-        "SSE_PORT": "3333"
-      }
-    }
-  }
-}
-```
-
-The SSE_ENABLED and SSE_PORT variables are optional, but enable additional functionality through the SSE HTTP server.
-
-2. Restart Windsurf
-
-3. In your conversation with Claude in Windsurf, the SingleStore MCP tools will be available automatically when Claude needs to access database information.
-
-### Installing in Cursor
-
-1. Add the server configuration to your Cursor settings:
-   - Open Cursor
-   - Go to Settings (gear icon) > Extensions > Claude AI > MCP Servers
-   - Add a new MCP server with the following configuration:
-
-```json
-{
-  "singlestore": {
-    "command": "node",
-    "args": ["path/to/mcp-server-singlestore/build/index.js"],
-    "env": {
-      "SINGLESTORE_HOST": "your-host.singlestore.com",
-      "SINGLESTORE_PORT": "3306",
-      "SINGLESTORE_USER": "your-username",
-      "SINGLESTORE_PASSWORD": "your-password",
-      "SINGLESTORE_DATABASE": "your-database",
-      "SSE_ENABLED": "true",
-      "SSE_PORT": "3333"
-    }
-  }
-}
-```
-
-The SSE_ENABLED and SSE_PORT variables allow web applications to connect to the server via HTTP and receive real-time updates through Server-Sent Events.
-
-2. Restart Cursor
-
-3. When using Claude AI within Cursor, the SingleStore MCP tools will be available for database operations.
-
-
-## Security Considerations
-
-1. Never commit credentials to version control
-2. Use environment variables or secure configuration management
-3. Consider using a connection pooling mechanism for production use
-4. Implement appropriate access controls and user permissions in SingleStore
-5. Keep the SingleStore CA bundle up to date
-
-## Development
-
-### Project Structure
-
-```
-mcp-server-singlestore/
-├── src/
-│   └── index.ts      # Main server implementation
-├── package.json
-├── tsconfig.json
-├── README.md
-└── CHANGELOG.md
-```
-
-### Building
+### Bring up the stack
 
 ```bash
-npm run build
+cp .env.example .env
+# fill in STUDIO_HOST, CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET,
+# SINGLESTORE_USER/PASSWORD/DATABASE, and MCP_BEARER_TOKEN
+
+docker compose build
+docker compose up -d
+docker compose logs -f tunnel
 ```
 
-### Testing
+The `tunnel` container is internal to the `mcp-net` Docker network and
+exposes no host port. The MCP container reaches it as `tunnel:3306`.
+
+### Smoke tests
 
 ```bash
-npm test
+# Sidecar is healthy and listening
+docker compose ps tunnel
+
+# Plain-TCP reachability from the MCP container
+docker compose exec mcp nc -vz tunnel 3306        # expect: succeeded
+
+# End-to-end MySQL handshake through the tunnel
+docker compose exec mcp node -e \
+  "require('./build/db.js').createPool(require('./build/config.js').loadConfig().db).query('SELECT 1').then(r=>console.log(r[0]))"
+# expect: [ { '1': 1 } ]
+
+# From your laptop, list tables via mcp-remote (replace with your token + IP)
+mcp-remote http://<mini-ip>:8081/mcp --header "Authorization: Bearer $MCP_BEARER_TOKEN"
 ```
 
-## Troubleshooting
+### Failure-mode FAQ
 
-1. **Connection Issues**
-   - Verify credentials and host information in your environment variables
-   - Check SSL configuration
-   - Ensure database is accessible from your network
-   - Check your firewall settings to allow outbound connections to your SingleStore database
+| Symptom                                                | Likely cause                                                              |
+| ------------------------------------------------------ | ------------------------------------------------------------------------- |
+| `tunnel` exits with `403` or `401` in the logs         | Cloudflare Access rejected the service token. Double-check ID/secret and that the Service Auth policy is attached to the Studio app. |
+| `connect ECONNREFUSED tunnel:3306`                     | `tunnel` container is not healthy yet. `docker compose logs tunnel`.      |
+| `Got packets out of order`                             | Someone forgot `--binary` on websocat. Should never happen here.          |
+| `read ETIMEDOUT` after a few minutes                   | The WSS connection lapsed. The supervisor loop will reconnect; the MCP pool will reopen on the next query. |
+| `Access denied for user 'guestway_mcp_ro'`             | Tunnel is fine; MySQL credentials are wrong or the user lacks `SELECT`.   |
 
-2. **Build Issues**
-   - Clear node_modules and reinstall dependencies
-   - Verify TypeScript configuration
-   - Check Node.js version compatibility (should be 16+)
+### Security notes specific to this tunnel
 
-3. **MCP Integration Issues**
-   - Verify the path to the server's build/index.js file is correct in your client configuration
-   - Check that all environment variables are properly set in your client configuration
-   - Restart your client application after making configuration changes
-   - Check client logs for any error messages related to the MCP server
-   - Try running the server standalone first to validate it works outside the client
+Studio's `/proxy?hostname=&port=` accepts arbitrary host/port query
+parameters and proxies raw TCP to *anywhere reachable from the EC2 host*.
+Anyone holding a valid Cloudflare Access session against `singlestore.guestway.io`
+can pivot through Studio to e.g. internal Redis, S3 metadata, or other
+services. The Cloudflare Access policy is the real perimeter here:
 
-## Contributing
+- Restrict the Service Auth policy to a specific service token, not "any
+  authenticated user."
+- Keep `CF_ACCESS_CLIENT_SECRET` out of git, secret managers only.
+- Long-term, consider standing up a dedicated Cloudflare Access TCP
+  application with `cloudflared access tcp` ingress fixed to
+  `tcp://127.0.0.1:3306` on the EC2 side. That removes the pivot risk.
 
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
+## CA bundle
+
+The SingleStore CA bundle is vendored at
+[`src/ca/singlestore-bundle.pem`](src/ca/singlestore-bundle.pem) and loaded
+at startup. To refresh it:
+
+```bash
+npm run update-ca
+git diff src/ca/singlestore-bundle.pem
+git add src/ca/singlestore-bundle.pem
+```
+
+## Security notes
+
+- **Read-only by design.** `query_table`, `create_table`, and
+  `generate_synthetic_data` from the upstream fork have been removed. If
+  you ever need them back, they need a separate `MCP_ALLOW_WRITES` flag,
+  a separate connection pool with elevated privileges, and a different
+  `name` so callers can tell which surface they're talking to.
+- **The HTTP transport is authenticated and rate-limited.** The default
+  bind is loopback. Refuses to bind to a non-loopback interface unless a
+  bearer token is configured.
+- **Defense in depth at the database.** This MCP must connect with a role
+  that has only `SELECT` (and optionally `EXECUTE` on profile-related
+  procedures). Do not rely on the application layer for safety.
+- **Logs are stderr-only**, JSON-structured (`pino`), with `Authorization`
+  and `password` fields redacted automatically.
 
 ## License
 
-MIT License - see LICENSE file for details
+MIT. See [`LICENSE`](LICENSE).
