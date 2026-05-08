@@ -3,8 +3,9 @@ name: Publish image to GHCR
 # Manual-trigger build of the SingleStore MCP image consumed by the
 # infrastructure repo's MCP Fargate task. The workflow:
 #
-#   1. Builds Dockerfile for linux/arm64 + linux/amd64 (Fargate runs arm64;
-#      amd64 is convenient for local testing on Intel hardware).
+#   1. Builds Dockerfile for linux/arm64 only — Fargate runs on Graviton.
+#      (Switch to a native arm64 runner like `ubuntu-24.04-arm` to drop
+#      the QEMU emulation overhead if the build ever feels slow.)
 #   2. Pushes to ghcr.io/<org>/singlestore-mcp-server with tags
 #      :latest and :sha-<short>.
 #   3. Best-effort flips the GHCR package to public visibility, so the
@@ -66,7 +67,7 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
