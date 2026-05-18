@@ -1,6 +1,6 @@
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import http from 'node:http';
-import express, { type Request, type Response, type NextFunction } from 'express';
+import express, { type Request, type Response } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
@@ -33,7 +33,7 @@ export async function startHttpServer(cfg: AppConfig): Promise<HttpServerHandle>
   const corsOptions: cors.CorsOptions = {
     origin: cfg.http.allowedOrigins.length > 0 ? cfg.http.allowedOrigins : false,
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Authorization', 'Content-Type', 'Mcp-Session-Id', 'MCP-Protocol-Version', 'Last-Event-ID'],
+    allowedHeaders: ['Content-Type', 'Mcp-Session-Id', 'MCP-Protocol-Version', 'Last-Event-ID'],
     exposedHeaders: ['Mcp-Session-Id'],
     credentials: false,
     maxAge: 600,
@@ -65,7 +65,6 @@ export async function startHttpServer(cfg: AppConfig): Promise<HttpServerHandle>
     });
   }
 
-  app.use(MCP_PATH, bearerAuth(cfg.http.bearerToken));
   app.use(MCP_PATH, express.json({ limit: cfg.http.bodyLimit }));
 
   const handler = async (req: Request, res: Response): Promise<void> => {
@@ -135,12 +134,21 @@ export async function startHttpServer(cfg: AppConfig): Promise<HttpServerHandle>
     {
       host: cfg.http.host,
       port: cfg.http.port,
-      authRequired: Boolean(cfg.http.bearerToken),
       allowedOrigins: cfg.http.allowedOrigins,
       allowedHosts: cfg.http.allowedHosts,
     },
-    'mcp Streamable HTTP transport listening',
+    'mcp Streamable HTTP transport listening (no auth)',
   );
+
+  const isLoopback = cfg.http.host === '127.0.0.1' || cfg.http.host === 'localhost' || cfg.http.host === '::1';
+  if (!isLoopback) {
+    logger.warn(
+      { host: cfg.http.host, port: cfg.http.port },
+      'MCP HTTP endpoint is bound to a non-loopback interface WITHOUT authentication. ' +
+        'Anyone able to reach this host:port can run read-only SQL via the MCP. ' +
+        'The Cloudflare Access tunnel does NOT cover this hop.',
+    );
+  }
 
   return {
     port: cfg.http.port,
@@ -155,26 +163,5 @@ export async function startHttpServer(cfg: AppConfig): Promise<HttpServerHandle>
       }
       sessions.clear();
     },
-  };
-}
-
-function bearerAuth(token: string | undefined) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    if (!token) {
-      // No token configured; loopback bind already enforced upstream.
-      return next();
-    }
-    const header = req.headers.authorization;
-    if (!header || !header.startsWith('Bearer ')) {
-      res.status(401).json({ error: 'unauthorized' });
-      return;
-    }
-    const provided = Buffer.from(header.slice('Bearer '.length).trim());
-    const expected = Buffer.from(token);
-    if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
-      res.status(401).json({ error: 'unauthorized' });
-      return;
-    }
-    next();
   };
 }

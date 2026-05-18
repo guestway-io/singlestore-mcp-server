@@ -36,6 +36,17 @@ project adheres to semantic versioning.
   `SINGLESTORE_HOST` defaults to `tunnel`, TLS defaults to off (matches
   the existing `--skip-ssl` mariadb usage in `export-org.nu`).
 
+### Removed
+- **Bearer-token authentication on the `/mcp` HTTP endpoint** and the
+  associated `MCP_BEARER_TOKEN` env var. The HTTP transport is now
+  unauthenticated; the server logs a loud `WARN` when bound to a
+  non-loopback interface so it's visible in logs. Trust the network the
+  Mac mini is on, or front it with something that does auth (mTLS proxy,
+  Tailscale ACL, etc.). The Cloudflare Access tunnel only protects the
+  Mac mini → SingleStore hop, not the laptop → Mac mini hop.
+- `Authorization` from the CORS allow-headers list and from logger
+  redaction paths.
+
 ## [0.1.0] - 2026-05-07
 
 Forked from `madhukarkumar/singlestore-mcp-server` and rebranded to

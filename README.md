@@ -33,7 +33,7 @@ Claude Desktop (laptop)
     │  stdio
     ▼
 mcp-remote
-    │  HTTPS + bearer (Streamable HTTP)
+    │  HTTP (Streamable HTTP) - office LAN, no auth
     ▼
 guestway-singlestore-mcp  ← Mac mini, Docker
     │  plain TCP MySQL on tunnel:3306
@@ -100,14 +100,18 @@ Copy `.env.example` to `.env` and edit.
 | Var                      | Default       | Notes                                                                             |
 | ------------------------ | ------------- | --------------------------------------------------------------------------------- |
 | `MCP_HTTP_ENABLED`       | `false`       | Set to `true` for remote clients.                                                 |
-| `MCP_HTTP_HOST`          | `127.0.0.1`   | Refuses to bind to a non-loopback host without `MCP_BEARER_TOKEN`.                |
+| `MCP_HTTP_HOST`          | `127.0.0.1`   | Bind address. Set to `0.0.0.0` for LAN access. Logs a loud WARN if non-loopback.  |
 | `MCP_HTTP_PORT`          | `8081`        |                                                                                   |
-| `MCP_BEARER_TOKEN`       | _unset_       | Required for non-loopback. Generate with `openssl rand -hex 32`.                  |
 | `MCP_ALLOWED_ORIGINS`    | _unset_       | Comma-separated CORS allowlist. Empty = deny all browser origins.                 |
 | `MCP_ALLOWED_HOSTS`      | _unset_       | Comma-separated `Host`-header allowlist (DNS-rebinding defense).                  |
 | `MCP_RATE_LIMIT_PER_MIN` | `120`         | Per-IP requests per minute against `/mcp`.                                        |
 | `MCP_BODY_LIMIT`         | `256kb`       | Max request body.                                                                 |
 | `LOG_LEVEL`              | `info`        | `pino` levels.                                                                    |
+
+> The HTTP endpoint is **unauthenticated**. Anyone able to reach
+> `MCP_HTTP_HOST:MCP_HTTP_PORT` can run the read-only tools. Run only on a
+> trusted network. The Cloudflare Access tunnel only protects the
+> Mac mini → SingleStore hop, not the laptop → Mac mini hop.
 
 ## Local development
 
@@ -150,9 +154,7 @@ to bridge stdio to the Mac mini's HTTP endpoint.
       "args": [
         "-y",
         "mcp-remote",
-        "http://<mini-ip>:8081/mcp",
-        "--header",
-        "Authorization: Bearer <MCP_BEARER_TOKEN>"
+        "http://<mini-ip>:8081/mcp"
       ]
     }
   }
@@ -189,7 +191,7 @@ sidecar bridges the MCP container's TCP traffic into that WebSocket using
 ```bash
 cp .env.example .env
 # fill in STUDIO_HOST, CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET,
-# SINGLESTORE_USER/PASSWORD/DATABASE, and MCP_BEARER_TOKEN
+# SINGLESTORE_USER/PASSWORD/DATABASE
 
 docker compose build
 docker compose up -d
@@ -213,8 +215,8 @@ docker compose exec mcp node -e \
   "require('./build/db.js').createPool(require('./build/config.js').loadConfig().db).query('SELECT 1').then(r=>console.log(r[0]))"
 # expect: [ { '1': 1 } ]
 
-# From your laptop, list tables via mcp-remote (replace with your token + IP)
-mcp-remote http://<mini-ip>:8081/mcp --header "Authorization: Bearer $MCP_BEARER_TOKEN"
+# From your laptop, list tables via mcp-remote (replace with the mini's IP)
+mcp-remote http://<mini-ip>:8081/mcp
 ```
 
 ### Failure-mode FAQ
@@ -261,14 +263,16 @@ git add src/ca/singlestore-bundle.pem
   you ever need them back, they need a separate `MCP_ALLOW_WRITES` flag,
   a separate connection pool with elevated privileges, and a different
   `name` so callers can tell which surface they're talking to.
-- **The HTTP transport is authenticated and rate-limited.** The default
-  bind is loopback. Refuses to bind to a non-loopback interface unless a
-  bearer token is configured.
+- **The HTTP transport is unauthenticated and rate-limited.** The default
+  bind is loopback. Binding to a non-loopback host (e.g. `0.0.0.0` for LAN
+  access) emits a loud `WARN` at startup. Only run this on a network you
+  trust; the Cloudflare Access tunnel covers the Mac mini → SingleStore
+  hop, not the laptop → Mac mini hop.
 - **Defense in depth at the database.** This MCP must connect with a role
-  that has only `SELECT` (and optionally `EXECUTE` on profile-related
-  procedures). Do not rely on the application layer for safety.
-- **Logs are stderr-only**, JSON-structured (`pino`), with `Authorization`
-  and `password` fields redacted automatically.
+  that has only `SELECT` (and optionally `PROCESS` for `optimize_sql`).
+  Do not rely on the application layer for safety.
+- **Logs are stderr-only**, JSON-structured (`pino`), with `password`,
+  `token`, and `Cookie` fields redacted automatically.
 
 ## License
 

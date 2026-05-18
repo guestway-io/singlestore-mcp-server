@@ -30,7 +30,6 @@ export interface AppConfig {
     enabled: boolean;
     host: string;
     port: number;
-    bearerToken: string | undefined;
     allowedOrigins: string[];
     allowedHosts: string[];
     rateLimitPerMinute: number;
@@ -109,14 +108,6 @@ function loadTlsConfig(): DbTlsConfig {
 export function loadConfig(): AppConfig {
   const httpEnabled = (process.env.MCP_HTTP_ENABLED ?? process.env.SSE_ENABLED ?? 'false') === 'true';
   const httpHost = process.env.MCP_HTTP_HOST ?? '127.0.0.1';
-  const bearerToken = process.env.MCP_BEARER_TOKEN?.trim() || undefined;
-
-  if (httpEnabled && !bearerToken && httpHost !== '127.0.0.1' && httpHost !== 'localhost' && httpHost !== '::1') {
-    throw new Error(
-      'Refusing to bind MCP HTTP transport to a non-loopback host without MCP_BEARER_TOKEN. ' +
-        'Either set MCP_BEARER_TOKEN, set MCP_HTTP_HOST=127.0.0.1, or disable MCP_HTTP_ENABLED.',
-    );
-  }
 
   return {
     db: {
@@ -133,7 +124,6 @@ export function loadConfig(): AppConfig {
       enabled: httpEnabled,
       host: httpHost,
       port: parsePort(process.env.MCP_HTTP_PORT ?? process.env.MCP_SSE_PORT ?? process.env.SSE_PORT, 8081),
-      bearerToken,
       allowedOrigins: parseList(process.env.MCP_ALLOWED_ORIGINS),
       allowedHosts: parseList(process.env.MCP_ALLOWED_HOSTS),
       rateLimitPerMinute: parsePort(process.env.MCP_RATE_LIMIT_PER_MIN, 120),
